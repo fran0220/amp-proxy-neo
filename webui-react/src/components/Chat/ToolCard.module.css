@@ -1,0 +1,135 @@
+.card {
+  background: var(--tool-bg);
+  border: 1px solid var(--tool-border);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  overflow: hidden;
+  transition: border-color 0.15s;
+}
+
+.card:hover {
+  border-color: var(--border-strong);
+}
+
+.card.thinking {
+  background: var(--thinking-bg);
+  border-color: var(--thinking-border);
+}
+
+.card.thinking .name {
+  color: var(--thinking-text);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  text-align: left;
+  font-family: "SF Mono", Menlo, "JetBrains Mono", monospace;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.chevron {
+  color: var(--text-dim);
+  transition: transform 0.15s;
+  flex-shrink: 0;
+}
+
+.chevron.open {
+  transform: rotate(90deg);
+}
+
+.icon {
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.name {
+  font-weight: 500;
+  color: var(--text);
+}
+
+.preview {
+  flex: 1;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 400;
+}
+
+.status {
+  margin-left: auto;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+}
+
+.done .status {
+  color: var(--accent);
+}
+
+.body {
+  border-top: 1px solid var(--border);
+  padding: 0;
+}
+
+.section {
+  padding: 8px 12px;
+}
+
+.section + .section {
+  border-top: 1px solid var(--border);
+}
+
+.sectionLabel {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+
+.code {
+  font-family: "SF Mono", Menlo, "JetBrains Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+  max-height: 400px;
+  overflow: auto;
+  background: var(--surface);
+  padding: 8px 10px;
+  border-radius: 4px;
+}
+
+.resultLine {
+  font-family: "SF Mono", Menlo, "JetBrains Mono", monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 0 12px 8px 36px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(0, 160, 86, 0.2);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  display: inline-block;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

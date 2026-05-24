@@ -1,0 +1,22 @@
+# Build artifacts
+amp-proxy
+*.app/
+
+# Databases / logs
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# macOS
+.DS_Store
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Cloudflare Wrangler
+.wrangler/
+.dev.vars

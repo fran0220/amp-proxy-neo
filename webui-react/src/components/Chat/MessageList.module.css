@@ -1,0 +1,21 @@
+.list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 0;
+  scroll-behavior: smooth;
+}
+
+.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-faint);
+  font-size: 13px;
+}
+
+@media (max-width: 720px) {
+  .list {
+    padding: 12px 0;
+  }
+}

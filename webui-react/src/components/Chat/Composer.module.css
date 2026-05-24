@@ -1,0 +1,53 @@
+.composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 12px 24px 16px;
+  background: var(--bg);
+  max-width: 820px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.input {
+  flex: 1;
+  resize: none;
+  padding: 10px 14px;
+  font-size: 14px;
+  line-height: 1.55;
+  border-radius: 18px;
+  background: var(--surface);
+  min-height: 40px;
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+}
+
+.input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(0, 160, 86, 0.12);
+}
+
+.sendBtn {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-fg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+
+.sendBtn:hover:not(:disabled) {
+  background: #008e4c;
+}
+
+@media (max-width: 720px) {
+  .composer {
+    padding: 8px 12px 12px;
+  }
+}

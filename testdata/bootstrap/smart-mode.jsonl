@@ -1,0 +1,1 @@
+PENDING: run scripts/capture-bootstrap.sh on a Mac with amp-proxy passthrough and a real `amp -x "say hi" --mode smart` request. The script will replace this marker with redacted server→client bootstrap frame JSONL.
