@@ -101,13 +101,13 @@ func (pm *ClaudeProfileManager) Switch(id string) error {
 // the tray "Reload Token" action when the user re-logged in via Claude Code).
 func (pm *ClaudeProfileManager) ReloadActive() error {
 	_, mgr := pm.Active()
-	return mgr.loadFromKeychain()
+	return mgr.ReloadFromKeychain()
 }
 
 // RefreshActive forces an OAuth refresh for the active profile.
 func (pm *ClaudeProfileManager) RefreshActive(ctx context.Context) error {
 	_, mgr := pm.Active()
-	return mgr.refresh(ctx)
+	return mgr.ForceRefresh(ctx)
 }
 
 // List returns one ProfileStatus per configured profile (or a single synthetic

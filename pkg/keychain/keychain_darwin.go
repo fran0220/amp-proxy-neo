@@ -80,6 +80,38 @@ func ReadClaudeKeychainCredentials(suffix string) (*KeychainCredentials, error) 
 	return creds, nil
 }
 
+// WriteClaudeKeychainCredentials persists Claude Code OAuth credentials back to
+// the macOS Keychain entry identified by suffix. This lets multiple processes
+// (Claude.app, legacy amp-proxy, amp-proxy-neo) share the latest rotated
+// refresh token: whichever process refreshes successfully writes back, and the
+// next cold-starting process picks up the fresh entry instead of the stale one.
+//
+// Uses `security add-generic-password -U` (update if exists) to avoid CGO.
+func WriteClaudeKeychainCredentials(suffix string, creds *KeychainCredentials) error {
+	if creds == nil || creds.AccessToken == "" {
+		return fmt.Errorf("refusing to write empty credentials")
+	}
+	account, err := currentUsername()
+	if err != nil {
+		return fmt.Errorf("get current user: %w", err)
+	}
+	service := KeychainServiceName(suffix)
+	payload, err := json.Marshal(keychainWrapper{ClaudeAiOauth: creds})
+	if err != nil {
+		return fmt.Errorf("marshal keychain payload: %w", err)
+	}
+	cmd := exec.Command("security", "add-generic-password",
+		"-U",
+		"-s", service,
+		"-a", account,
+		"-w", string(payload),
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("keychain write failed (service=%q): %w: %s", service, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func currentUsername() (string, error) {
 	u, err := user.Current()
 	if err != nil {

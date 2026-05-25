@@ -6,35 +6,47 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fran0220/amp-proxy-neo/pkg/keychain"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/sync/singleflight"
 )
 
 const (
 	anthropicTokenURL  = "https://api.anthropic.com/v1/oauth/token"
 	anthropicClientID  = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	tokenRefreshMargin = 5 * time.Minute
+	// keychainCacheTTL bounds how stale our in-memory snapshot may be before
+	// we go back to the keychain. Short enough that a refresh by another
+	// process (Claude.app, legacy amp-proxy) is picked up quickly; long
+	// enough that we are not hitting the `security` CLI on every request.
+	keychainCacheTTL = 5 * time.Second
 )
 
-// TokenManager manages the lifecycle of Claude OAuth tokens.
-// It reads from Keychain on startup and automatically refreshes before expiry.
-// Each TokenManager is bound to a specific Keychain entry suffix so that
-// multiple Claude profiles can coexist in the same process.
+// TokenManager exposes Claude OAuth tokens with the macOS Keychain as the
+// single source of truth. There is no long-lived in-memory copy of the
+// access/refresh token — every call freshly consults the keychain (cached for
+// up to keychainCacheTTL to avoid `security` CLI overhead), and any refresh
+// against Anthropic is wrapped in a per-suffix file lock so multiple processes
+// (Claude.app, legacy amp-proxy, amp-proxy-neo) never race the rotated
+// refresh token.
 type TokenManager struct {
 	keychainSuffix string
-	mu             sync.RWMutex
-	accessToken    string
-	refreshToken   string
-	expiresAt      time.Time
-	lastRefresh    time.Time
-	lastError      error
-	sfGroup        singleflight.Group
 	httpClient     *http.Client
+
+	mu        sync.Mutex // guards snapshot
+	snapshot  *credsSnapshot
+	snapAt    time.Time
+	loadError error
+}
+
+type credsSnapshot struct {
+	creds *keychain.KeychainCredentials
 }
 
 // TokenStatus is a snapshot of token state for UI display.
@@ -45,74 +57,87 @@ type TokenStatus struct {
 }
 
 // NewTokenManager constructs a TokenManager bound to the default Keychain entry.
-// Equivalent to NewTokenManagerForSuffix("").
 func NewTokenManager() *TokenManager {
 	return NewTokenManagerForSuffix("")
 }
 
 // NewTokenManagerForSuffix constructs a TokenManager bound to the Claude Code
-// Keychain entry "Claude Code-credentials[-<suffix>]".
+// Keychain entry "Claude Code-credentials[-<suffix>]". No background goroutine
+// is started — refresh happens lazily inside GetAccessToken.
 func NewTokenManagerForSuffix(suffix string) *TokenManager {
 	tm := &TokenManager{
 		keychainSuffix: suffix,
 		httpClient:     &http.Client{Timeout: 30 * time.Second},
 	}
-
 	label := keychain.KeychainServiceName(suffix)
-
-	// Load initial credentials from Keychain
-	if err := tm.loadFromKeychain(); err != nil {
+	if creds, err := tm.readKeychainFresh(); err != nil {
 		log.Warnf("[%s] failed to load OAuth token from Keychain: %v", label, err)
-		tm.lastError = err
 	} else {
-		log.Infof("[%s] loaded OAuth token from Keychain (expires in %s)", label, time.Until(tm.expiresAt).Round(time.Second))
+		log.Infof("[%s] loaded OAuth token from Keychain (expires in %s)", label, time.Until(time.UnixMilli(creds.ExpiresAt)).Round(time.Second))
 	}
-
-	// Start background refresh loop
-	go tm.refreshLoop()
-
 	return tm
 }
 
-// GetAccessToken returns a valid access token, refreshing if necessary.
+// GetAccessToken returns a non-expired access token, refreshing through the
+// cross-process file lock if necessary. The returned token always reflects the
+// latest keychain state at call time (within keychainCacheTTL).
 func (tm *TokenManager) GetAccessToken(ctx context.Context) (string, error) {
-	tm.mu.RLock()
-	token := tm.accessToken
-	expiresAt := tm.expiresAt
-	tm.mu.RUnlock()
-
-	if token != "" && time.Now().Before(expiresAt.Add(-tokenRefreshMargin)) {
-		return token, nil
+	creds, err := tm.readKeychain()
+	if err != nil {
+		return "", err
 	}
-
-	// Token expired or about to expire — refresh
-	if err := tm.refresh(ctx); err != nil {
-		// If refresh fails but token is still technically valid, use it
-		if token != "" && time.Now().Before(expiresAt) {
+	expiresAt := time.UnixMilli(creds.ExpiresAt)
+	if creds.AccessToken != "" && time.Now().Before(expiresAt.Add(-tokenRefreshMargin)) {
+		return creds.AccessToken, nil
+	}
+	// Token expired or about to expire. Acquire the cross-process lock, then
+	// re-check (some other process — including legacy amp-proxy or Claude.app —
+	// may have refreshed while we were waiting), and only then refresh.
+	unlock, err := tm.lock()
+	if err != nil {
+		return "", fmt.Errorf("acquire claude refresh lock: %w", err)
+	}
+	defer unlock()
+	tm.invalidateCache()
+	creds, err = tm.readKeychainFresh()
+	if err == nil && creds.AccessToken != "" && time.Now().Before(time.UnixMilli(creds.ExpiresAt).Add(-tokenRefreshMargin)) {
+		return creds.AccessToken, nil
+	}
+	if creds == nil || creds.RefreshToken == "" {
+		if creds != nil && creds.AccessToken != "" && time.Now().Before(time.UnixMilli(creds.ExpiresAt)) {
+			return creds.AccessToken, nil
+		}
+		return "", fmt.Errorf("no refresh token available")
+	}
+	updated, err := tm.doRefresh(ctx, creds)
+	if err != nil {
+		// Refresh failed but the existing access token may still be technically
+		// valid — let the caller try it once before giving up.
+		if creds.AccessToken != "" && time.Now().Before(time.UnixMilli(creds.ExpiresAt)) {
 			log.Warnf("token refresh failed but token still valid: %v", err)
-			return token, nil
+			return creds.AccessToken, nil
 		}
 		return "", fmt.Errorf("token expired and refresh failed: %w", err)
 	}
-
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	return tm.accessToken, nil
+	if writeErr := keychain.WriteClaudeKeychainCredentials(tm.keychainSuffix, updated); writeErr != nil {
+		log.Warnf("[%s] keychain write-back failed: %v", keychain.KeychainServiceName(tm.keychainSuffix), writeErr)
+	} else {
+		log.Infof("[%s] keychain refreshed (expiresAt=%s)", keychain.KeychainServiceName(tm.keychainSuffix), time.UnixMilli(updated.ExpiresAt).Format(time.RFC3339))
+	}
+	tm.invalidateCache()
+	return updated.AccessToken, nil
 }
 
-// Status returns a snapshot for UI display.
+// Status returns a snapshot of the keychain-backed token state for UI.
 func (tm *TokenManager) Status() TokenStatus {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-
-	if tm.lastError != nil && tm.accessToken == "" {
-		return TokenStatus{Valid: false, Error: tm.lastError}
+	creds, err := tm.readKeychain()
+	if err != nil {
+		return TokenStatus{Valid: false, Error: err}
 	}
-	if tm.accessToken == "" {
+	if creds.AccessToken == "" {
 		return TokenStatus{Valid: false, Error: fmt.Errorf("no token loaded")}
 	}
-
-	remaining := time.Until(tm.expiresAt)
+	remaining := time.Until(time.UnixMilli(creds.ExpiresAt))
 	if remaining <= 0 {
 		return TokenStatus{Valid: false, Error: fmt.Errorf("token expired")}
 	}
@@ -127,131 +152,156 @@ func (tm *TokenManager) KeychainSuffix() string {
 	return tm.keychainSuffix
 }
 
-func (tm *TokenManager) loadFromKeychain() error {
-	creds, err := keychain.ReadClaudeKeychainCredentials(tm.keychainSuffix)
-	if err != nil {
-		return err
-	}
-
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	tm.accessToken = creds.AccessToken
-	tm.refreshToken = creds.RefreshToken
-	tm.expiresAt = time.UnixMilli(creds.ExpiresAt)
-	tm.lastError = nil
-	return nil
-}
-
-func (tm *TokenManager) refresh(ctx context.Context) error {
-	_, err, _ := tm.sfGroup.Do("refresh", func() (interface{}, error) {
-		tm.mu.RLock()
-		refreshToken := tm.refreshToken
-		tm.mu.RUnlock()
-
-		if refreshToken == "" {
-			return nil, fmt.Errorf("no refresh token available")
-		}
-
-		newAccess, newRefresh, expiresIn, err := tm.doRefresh(ctx, refreshToken)
-		if err != nil {
-			tm.mu.Lock()
-			tm.lastError = err
-			tm.mu.Unlock()
-			return nil, err
-		}
-
-		tm.mu.Lock()
-		tm.accessToken = newAccess
-		if newRefresh != "" {
-			tm.refreshToken = newRefresh
-		}
-		tm.expiresAt = time.Now().Add(time.Duration(expiresIn) * time.Second)
-		tm.lastRefresh = time.Now()
-		tm.lastError = nil
-		tm.mu.Unlock()
-
-		log.Infof("token refreshed, expires in %ds", expiresIn)
-		return nil, nil
-	})
+// ReloadFromKeychain invalidates the in-memory cache and re-reads the
+// keychain entry. Used by the tray "Reload Token" action and tests.
+func (tm *TokenManager) ReloadFromKeychain() error {
+	tm.invalidateCache()
+	_, err := tm.readKeychainFresh()
 	return err
 }
 
-// doRefresh performs the actual OAuth token refresh HTTP request.
-func (tm *TokenManager) doRefresh(ctx context.Context, refreshToken string) (accessToken, newRefreshToken string, expiresIn int, err error) {
+// ForceRefresh runs an OAuth refresh under the cross-process lock and writes
+// the rotated credentials back to keychain. Used by the admin
+// `/api/token/refresh` endpoint.
+func (tm *TokenManager) ForceRefresh(ctx context.Context) error {
+	unlock, err := tm.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	tm.invalidateCache()
+	current, err := tm.readKeychainFresh()
+	if err != nil {
+		return err
+	}
+	if current.RefreshToken == "" {
+		return fmt.Errorf("no refresh token available")
+	}
+	updated, err := tm.doRefresh(ctx, current)
+	if err != nil {
+		return err
+	}
+	if err := keychain.WriteClaudeKeychainCredentials(tm.keychainSuffix, updated); err != nil {
+		return fmt.Errorf("keychain write-back: %w", err)
+	}
+	tm.invalidateCache()
+	return nil
+}
+
+// readKeychain returns a cached snapshot (up to keychainCacheTTL old) to avoid
+// shelling out to `security` on every single request.
+func (tm *TokenManager) readKeychain() (*keychain.KeychainCredentials, error) {
+	tm.mu.Lock()
+	if tm.snapshot != nil && time.Since(tm.snapAt) < keychainCacheTTL {
+		creds := tm.snapshot.creds
+		tm.mu.Unlock()
+		if creds != nil {
+			return creds, nil
+		}
+	} else {
+		tm.mu.Unlock()
+	}
+	return tm.readKeychainFresh()
+}
+
+func (tm *TokenManager) readKeychainFresh() (*keychain.KeychainCredentials, error) {
+	creds, err := keychain.ReadClaudeKeychainCredentials(tm.keychainSuffix)
+	tm.mu.Lock()
+	if err != nil {
+		tm.loadError = err
+		tm.snapshot = nil
+		tm.snapAt = time.Now()
+		tm.mu.Unlock()
+		return nil, err
+	}
+	tm.snapshot = &credsSnapshot{creds: creds}
+	tm.snapAt = time.Now()
+	tm.loadError = nil
+	tm.mu.Unlock()
+	return creds, nil
+}
+
+func (tm *TokenManager) invalidateCache() {
+	tm.mu.Lock()
+	tm.snapshot = nil
+	tm.snapAt = time.Time{}
+	tm.mu.Unlock()
+}
+
+// lock acquires a process-wide advisory lock on a file shared by all processes
+// touching the same keychain suffix. Returns an unlock closure.
+func (tm *TokenManager) lock() (func(), error) {
+	dir := filepath.Join(os.TempDir(), "amp-proxy-claude-locks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	suffix := tm.keychainSuffix
+	if suffix == "" {
+		suffix = "default"
+	}
+	path := filepath.Join(dir, "claude-"+suffix+".lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+// doRefresh performs the actual OAuth token refresh HTTP request and returns
+// a brand-new KeychainCredentials with rotated tokens + preserved metadata.
+func (tm *TokenManager) doRefresh(ctx context.Context, current *keychain.KeychainCredentials) (*keychain.KeychainCredentials, error) {
 	body := map[string]string{
 		"client_id":     anthropicClientID,
 		"grant_type":    "refresh_token",
-		"refresh_token": refreshToken,
+		"refresh_token": current.RefreshToken,
 	}
 	bodyJSON, _ := json.Marshal(body)
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicTokenURL, strings.NewReader(string(bodyJSON)))
 	if err != nil {
-		return "", "", 0, err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-
 	resp, err := tm.httpClient.Do(req)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("refresh request failed: %w", err)
+		return nil, fmt.Errorf("refresh request failed: %w", err)
 	}
 	defer resp.Body.Close()
-
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("read refresh response: %w", err)
+		return nil, fmt.Errorf("read refresh response: %w", err)
 	}
-
 	if resp.StatusCode != http.StatusOK {
-		return "", "", 0, fmt.Errorf("refresh failed (status %d): %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("refresh failed (status %d): %s", resp.StatusCode, string(respBody))
 	}
-
 	var result struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
 		ExpiresIn    int    `json:"expires_in"`
 	}
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", "", 0, fmt.Errorf("parse refresh response: %w", err)
+		return nil, fmt.Errorf("parse refresh response: %w", err)
 	}
-
 	if result.AccessToken == "" {
-		return "", "", 0, fmt.Errorf("refresh returned empty access token")
+		return nil, fmt.Errorf("refresh returned empty access token")
 	}
-
-	return result.AccessToken, result.RefreshToken, result.ExpiresIn, nil
-}
-
-// refreshLoop periodically checks and refreshes the token before expiry.
-func (tm *TokenManager) refreshLoop() {
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		tm.mu.RLock()
-		expiresAt := tm.expiresAt
-		hasRefresh := tm.refreshToken != ""
-		tm.mu.RUnlock()
-
-		if !hasRefresh {
-			continue
-		}
-
-		remaining := time.Until(expiresAt)
-		if remaining < tokenRefreshMargin {
-			log.Info("token approaching expiry, refreshing...")
-			if err := tm.refresh(context.Background()); err != nil {
-				log.Errorf("background token refresh failed: %v", err)
-				// Refresh token may be stale — try reloading from Keychain
-				log.Info("reloading token from Keychain...")
-				if err2 := tm.loadFromKeychain(); err2 != nil {
-					log.Errorf("keychain reload also failed: %v", err2)
-				} else {
-					log.Info("token reloaded from Keychain")
-				}
-			}
-		}
+	newRefresh := result.RefreshToken
+	if newRefresh == "" {
+		newRefresh = current.RefreshToken
 	}
+	return &keychain.KeychainCredentials{
+		AccessToken:      result.AccessToken,
+		RefreshToken:     newRefresh,
+		ExpiresAt:        time.Now().Add(time.Duration(result.ExpiresIn) * time.Second).UnixMilli(),
+		Scopes:           current.Scopes,
+		SubscriptionType: current.SubscriptionType,
+		RateLimitTier:    current.RateLimitTier,
+	}, nil
 }
