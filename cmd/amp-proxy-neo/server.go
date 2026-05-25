@@ -30,6 +30,8 @@ func (s *appState) proxyMux() http.Handler {
 	mux.HandleFunc("/health", s.health)
 	mux.HandleFunc("/api/status", s.health)
 	mux.HandleFunc("/api/internal", s.internal)
+	mux.HandleFunc("/api/telemetry", s.telemetry)
+	mux.HandleFunc("/api/v2/spans", s.telemetry)
 	if s.cfg.SelfServe() {
 		actors := selfserve.ActorsHandler()
 		mux.Handle("/metadata", selfserve.MetadataHandler())
@@ -76,7 +78,12 @@ func (s *appState) internal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.cfg.SelfServe() {
-		rr.copyTo(w)
+		// threadstore only knows uploadThread/getThread/listThreads/deleteThread —
+		// every other action (getUserInfo, loadPlugins, getThreadLabels, etc.)
+		// falls through to the self-serve stub router so the amp CLI can boot
+		// without an ampcode.com round-trip.
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		selfserve.InternalActionHandler(selfserve.InternalActionConfig{UserID: s.cfg.Neo.UserID}).ServeHTTP(w, r)
 		return
 	}
 	if s.upstream != nil {
@@ -85,6 +92,22 @@ func (s *appState) internal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rr.copyTo(w)
+}
+
+// telemetry accepts and discards amp CLI telemetry/spans in self-serve mode so
+// the CLI does not log warnings or back-off. Upstream mode forwards instead.
+func (s *appState) telemetry(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.SelfServe() {
+		_, _ = io.Copy(io.Discard, r.Body)
+		r.Body.Close()
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	if s.upstream != nil {
+		s.upstream.forward(w, r)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *appState) fallback(w http.ResponseWriter, r *http.Request) {
