@@ -59,7 +59,13 @@ func ModelSupportsTier(model, tier string) bool {
 
 func DefaultConfig() *Config {
 	return &Config{
-		Listen: ":9317",
+		Listen: ":9319",
+		Neo: NeoConfig{
+			SelfServe: true,
+			Update: NeoUpdateConfig{
+				Channel: "stable",
+			},
+		},
 		Amp: AmpConfig{
 			UpstreamURL: "https://ampcode.com",
 		},

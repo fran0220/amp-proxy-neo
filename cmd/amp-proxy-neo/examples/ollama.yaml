@@ -1,0 +1,15 @@
+# Ollama OpenAI-compatible local endpoint.
+# Start: ollama serve && ollama pull qwen3-coder:32b
+custom:
+  - id: ollama
+    name: Ollama
+    base-url: http://localhost:11434/v1
+    models:
+      - name: qwen3-coder:32b
+        route: apikey
+neo:
+  modes:
+    rush:
+      provider: custom:ollama
+      model: qwen3-coder:32b
+      auth: custom:ollama

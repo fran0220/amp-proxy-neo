@@ -1,5 +1,5 @@
 import { useCallback, useState, useRef } from "react";
-import { Menu } from "lucide-react";
+import { Menu, Square } from "lucide-react";
 import type { Message, ServerFrame, ThreadData } from "../../lib/types";
 import { MessageList } from "./MessageList";
 import { Composer } from "./Composer";
@@ -7,11 +7,14 @@ import { useStreamingChat } from "../../hooks/useStreamingChat";
 import styles from "./ChatPanel.module.css";
 
 interface Props {
+  connectionMode?: "direct" | "remote";
   activeThread: ThreadData | null;
   activeThreadId: string | null;
   messages: Message[];
   online: boolean;
+  connectionError?: string | null;
   send: (envelope: any) => boolean;
+  cancel?: (reqId: string | null) => boolean;
   subscribe: (cb: (f: ServerFrame) => void) => () => void;
   onMessageCommitted: (m: Message) => void;
   onThreadCreated: (id: string) => void;
@@ -21,11 +24,14 @@ interface Props {
 }
 
 export function ChatPanel({
+  connectionMode = "direct",
   activeThread,
   activeThreadId,
   messages,
   online,
+  connectionError,
   send,
+  cancel,
   subscribe,
   onMessageCommitted,
   onThreadCreated,
@@ -75,6 +81,10 @@ export function ChatPanel({
     localStorage.setItem("amp.defaultMode", m);
   }, []);
 
+  const handleCancel = useCallback(() => {
+    cancel?.(reqIdRef.current);
+  }, [cancel]);
+
   return (
     <main className={styles.chat}>
       <header className={styles.header}>
@@ -101,7 +111,19 @@ export function ChatPanel({
           <option value="deep">deep</option>
           <option value="frontier">frontier</option>
         </select>
+        {streaming.active && (
+          <button className={styles.cancelBtn} onClick={handleCancel} title="Cancel">
+            <Square size={13} />
+            Cancel
+          </button>
+        )}
       </header>
+
+      {connectionMode === "direct" && (
+        <div className={styles.notice}>
+          Browser-direct mode · tools disabled{connectionError ? ` · ${connectionError}` : ""}
+        </div>
+      )}
 
       <MessageList messages={messages} streaming={streaming} />
 

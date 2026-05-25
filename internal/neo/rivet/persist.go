@@ -13,19 +13,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fran0220/amp-proxy-neo/internal/neo/threadstore"
 	. "github.com/fran0220/amp-proxy-neo/pkg/config"
 	log "github.com/sirupsen/logrus"
 )
 
-// persistThreadToAmp builds a thread object matching Amp's persisted thread
-// schema and POSTs it to /api/internal?uploadThread on the configured Amp
-// upstream. This is necessary because in execute-mode (amp -x), the amp
-// client exits before its throttled (1s) uploader can flush — so we have to
-// do the upload ourselves.
-//
-// Called at the end of every successful inference turn. Failures are logged
-// but don't propagate to the user — the assistant text is already shown.
-func (s *RivetSession) persistThreadToAmp(ctx context.Context, cfg *Config) {
+// persistThread stores the Amp-shaped thread locally first, then best-effort
+// uploads it to the configured Amp upstream. Local persistence is the source
+// of truth for Neo; upstream upload is compatibility/backfill only.
+func (s *RivetSession) persistThread(ctx context.Context, cfg *Config) {
 	if s.threadID == "" {
 		return
 	}
@@ -42,17 +38,38 @@ func (s *RivetSession) persistThreadToAmp(ctx context.Context, cfg *Config) {
 		log.Warnf("[RIVET %d] skipping uploadThread (have %d msgs < server floor %d) — would clobber", s.connID, currentLen, floor)
 		return
 	}
+
+	thread := s.buildThreadForUpload()
+	if s.store == nil {
+		log.Errorf("[RIVET %d] no local threadstore configured", s.connID)
+		return
+	}
+	rawThread, err := json.Marshal(thread)
+	if err != nil {
+		log.Errorf("[RIVET %d] marshal local thread: %v", s.connID, err)
+		return
+	}
+	localThread, err := threadstore.ParseThread(rawThread)
+	if err != nil {
+		log.Errorf("[RIVET %d] parse local thread: %v", s.connID, err)
+		return
+	}
+	if err := s.store.UploadThread(ctx, localThread); err != nil {
+		log.Errorf("[RIVET %d] local UploadThread failed: %v", s.connID, err)
+		return
+	}
+	log.Infof("[RIVET %d] local UploadThread ok thread=%s msgs=%d", s.connID, s.threadID, len(localThread.Messages))
+
 	upstreamURL := strings.TrimRight(cfg.Amp.UpstreamURL, "/")
 	if upstreamURL == "" {
 		return
 	}
 	apiKey := strings.TrimSpace(cfg.Amp.APIKey)
 	if apiKey == "" {
-		log.Warnf("[RIVET %d] no amp api key, cannot upload thread", s.connID)
+		log.Debugf("[RIVET %d] no amp api key, skipping upstream upload", s.connID)
 		return
 	}
 
-	thread := s.buildThreadForUpload()
 	body := map[string]any{
 		"method": "uploadThread",
 		"params": map[string]any{
@@ -263,6 +280,18 @@ func (s *RivetSession) fetchThreadHistory(ctx context.Context, cfg *Config) ([]a
 	if s.threadID == "" {
 		return nil, false
 	}
+	if s.store != nil {
+		thread, err := s.store.GetThread(ctx, s.threadID)
+		if err == nil {
+			out, ok := s.hydrateFromRawThread(thread.Title, thread.Raw)
+			if ok {
+				log.Infof("[RIVET %d] local getThread ok thread=%s persisted_msgs=%d", s.connID, s.threadID, len(thread.Messages))
+				return out, true
+			}
+		} else if err != threadstore.ErrNotFound {
+			log.Warnf("[RIVET %d] local getThread: %v", s.connID, err)
+		}
+	}
 	upstreamURL := strings.TrimRight(cfg.Amp.UpstreamURL, "/")
 	if upstreamURL == "" {
 		return nil, false
@@ -323,6 +352,16 @@ func (s *RivetSession) fetchThreadHistory(ctx context.Context, cfg *Config) ([]a
 	if !envelope.Ok {
 		return nil, false
 	}
+	if s.store != nil {
+		if raw, err := json.Marshal(envelope.Result.Thread.Data); err == nil {
+			if thread, err := threadstore.ParseThread(raw); err == nil {
+				thread.Title = envelope.Result.Thread.Title
+				if err := s.store.UploadThread(ctx, thread); err != nil && err != threadstore.ErrVersionConflict {
+					log.Warnf("[RIVET %d] backfill local thread: %v", s.connID, err)
+				}
+			}
+		}
+	}
 	// Cache server-side fields needed for round-trip preservation.
 	d := envelope.Result.Thread.Data
 	s.mu.Lock()
@@ -343,6 +382,39 @@ func (s *RivetSession) fetchThreadHistory(ctx context.Context, cfg *Config) ([]a
 			continue
 		}
 		out = append(out, msg)
+	}
+	return out, true
+}
+
+func (s *RivetSession) hydrateFromRawThread(title string, raw json.RawMessage) ([]anthropicMessage, bool) {
+	var d struct {
+		V             int               `json:"v"`
+		Created       int64             `json:"created"`
+		Meta          json.RawMessage   `json:"meta"`
+		Env           json.RawMessage   `json:"env"`
+		CreatorUserID string            `json:"creatorUserID"`
+		Messages      []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		log.Warnf("[RIVET %d] local getThread parse: %v", s.connID, err)
+		return nil, false
+	}
+	s.mu.Lock()
+	s.serverV = d.V
+	s.serverMeta = append([]byte(nil), d.Meta...)
+	s.serverEnv = append([]byte(nil), d.Env...)
+	s.serverCreatorUserID = d.CreatorUserID
+	s.serverCreated = d.Created
+	if title != "" {
+		s.threadTitle = title
+	}
+	s.mu.Unlock()
+	out := make([]anthropicMessage, 0, len(d.Messages))
+	for _, raw := range d.Messages {
+		msg, ok := persistedMsgToAnthropic(raw)
+		if ok {
+			out = append(out, msg)
+		}
 	}
 	return out, true
 }

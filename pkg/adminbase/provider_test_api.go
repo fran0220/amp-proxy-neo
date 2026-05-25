@@ -1,6 +1,7 @@
 package adminbase
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,6 +24,24 @@ type DiscoveredModel struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	Provider string `json:"provider,omitempty"`
+}
+
+func (s *AdminServer) handleLLMProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		BaseURL string `json:"base_url"`
+		APIKey  string `json:"api_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	writeJSON(w, provider.ProbeCustomOpenAI(ctx, req.BaseURL, req.APIKey))
 }
 
 func testAPIKey(provider, apiKey, baseURL string) TestResult {

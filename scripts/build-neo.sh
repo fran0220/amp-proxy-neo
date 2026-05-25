@@ -2,17 +2,37 @@
 set -euo pipefail
 
 APP_NAME="AmpProxyNeo"
-VERSION="${VERSION:-0.1.0}"
 BINARY="amp-proxy-neo"
 APP_DIR="${APP_NAME}.app"
 TEMPLATE="deploy/neo.Info.plist.tmpl"
+EMBED_DIST="cmd/amp-proxy-neo/webui-react/dist"
+VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
+COMMIT="${COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+BUILD_DATE="${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+LDFLAGS="-s -w -X github.com/fran0220/amp-proxy-neo/pkg/util.BuildVersion=${VERSION} -X github.com/fran0220/amp-proxy-neo/pkg/util.BuildCommit=${COMMIT} -X github.com/fran0220/amp-proxy-neo/pkg/util.BuildDate=${BUILD_DATE} -X github.com/fran0220/amp-proxy-neo/pkg/util.Version=${VERSION}"
 
 echo "=== Building ${APP_NAME} macOS app ==="
+echo "→ Version ${VERSION} (${COMMIT}, ${BUILD_DATE})"
+
+echo "→ Preparing chat UI..."
+if command -v npm >/dev/null 2>&1; then
+  if [[ ! -f webui-react/dist/index.html ]] || find webui-react/src webui-react/index.html webui-react/package.json -newer webui-react/dist/index.html | grep -q .; then
+    (cd webui-react && npm install && npm run build) || echo "⚠️  webui-react build failed; embedding fallback UI"
+  fi
+else
+  echo "⚠️  npm not found; embedding existing dist or fallback UI"
+fi
+mkdir -p "${EMBED_DIST}/assets"
+if [[ -f webui-react/dist/index.html ]]; then
+  rm -rf "${EMBED_DIST}"
+  mkdir -p "$(dirname "${EMBED_DIST}")"
+  cp -R webui-react/dist "${EMBED_DIST}"
+fi
 
 echo "→ Compiling..."
 rm -rf "${APP_DIR}"
 mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
-CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o "${APP_DIR}/Contents/MacOS/${BINARY}" ./cmd/amp-proxy-neo
+CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o "${APP_DIR}/Contents/MacOS/${BINARY}" ./cmd/amp-proxy-neo
 
 echo "→ Writing Info.plist..."
 sed "s/{{VERSION}}/${VERSION}/g" "${TEMPLATE}" > "${APP_DIR}/Contents/Info.plist"
@@ -50,4 +70,6 @@ cp /tmp/amp-proxy-neo-icon-512.png /tmp/AmpProxyNeo.iconset/icon_512x512.png
 iconutil -c icns /tmp/AmpProxyNeo.iconset -o "${APP_DIR}/Contents/Resources/AppIcon.icns"
 rm -rf /tmp/AmpProxyNeo.iconset /tmp/amp-proxy-neo-icon-512.png
 
-echo "Built AmpProxyNeo.app — drag to /Applications/"
+echo "Built AmpProxyNeo.app"
+echo "Run: open AmpProxyNeo.app"
+echo "Install: cp -R AmpProxyNeo.app /Applications/"

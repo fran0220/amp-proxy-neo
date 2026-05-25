@@ -373,7 +373,7 @@ func (s *RivetSession) runGeminiRound(
 	s.mu.Lock()
 	s.history = append(s.history, anthropicMessage{Role: "assistant", Content: historyContent})
 	s.mu.Unlock()
-	s.persistThread()
+	s.persistInMemoryThread()
 
 	if len(toolCalls) == 0 || stopReason != "end_turn" && len(toolCalls) == 0 {
 		_ = writeFrameRaw(map[string]any{"type": "agent_state", "state": "idle", "agentMode": s.agentMode})
@@ -445,6 +445,6 @@ func (s *RivetSession) runGeminiRound(
 	s.mu.Lock()
 	s.history = append(s.history, anthropicMessage{Role: "user", Content: toolResults})
 	s.mu.Unlock()
-	s.persistThread()
+	s.persistInMemoryThread()
 	return false, textAccum.String(), messageID, nil
 }

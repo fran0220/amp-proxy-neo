@@ -23,12 +23,24 @@ interface Stats {
   total: number;
 }
 
+interface LLMProbeResult {
+  available_models?: string[];
+  supports_tools?: boolean;
+  supports_streaming?: boolean;
+  latency_ms?: number;
+  endpoint_kind?: string;
+  error?: string;
+}
+
 export function SettingsDrawer({ open, onClose }: Props) {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
   const [coordURL, setCoordURL] = useState("");
   const [clientSecret, setClientSecret] = useState("");
   const [defaultMode, setDefaultMode] = useState("smart");
+  const [probeURL, setProbeURL] = useState(localStorage.getItem("amp.localLLMProbeURL") || "http://localhost:11434/v1");
+  const [probe, setProbe] = useState<LLMProbeResult | null>(null);
+  const [probing, setProbing] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -56,6 +68,21 @@ export function SettingsDrawer({ open, onClose }: Props) {
     if (clientSecret) localStorage.setItem("amp.clientSecret", clientSecret);
     localStorage.setItem("amp.defaultMode", defaultMode);
     location.reload();
+  };
+
+  const runProbe = async () => {
+    setProbing(true);
+    localStorage.setItem("amp.localLLMProbeURL", probeURL);
+    try {
+      setProbe(await apiFetch("/api/llm-probe", {
+        method: "POST",
+        body: JSON.stringify({ base_url: probeURL }),
+      }));
+    } catch (e) {
+      setProbe({ error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setProbing(false);
+    }
   };
 
   return (
@@ -134,6 +161,34 @@ export function SettingsDrawer({ open, onClose }: Props) {
               <option value="deep">deep</option>
               <option value="frontier">frontier</option>
             </select>
+          </section>
+
+          <section>
+            <h3>Local LLM probe</h3>
+            <input
+              type="text"
+              value={probeURL}
+              onChange={(e) => setProbeURL(e.target.value)}
+              placeholder="http://localhost:11434/v1"
+              className={styles.input}
+            />
+            <button onClick={runProbe} className={styles.saveBtn} disabled={probing}>
+              {probing ? "Probing…" : "Probe endpoint"}
+            </button>
+            {probe && (
+              <div className={styles.probeResult}>
+                <div>Streaming: {probe.supports_streaming ? "✅" : "⚠️"}</div>
+                <div>Tools: {probe.supports_tools ? "✅ native" : "⚠ fallback to JSON-mode prompt"}</div>
+                {probe.latency_ms !== undefined && <div>Latency: {probe.latency_ms}ms</div>}
+                {probe.endpoint_kind && <div>Kind: {probe.endpoint_kind}</div>}
+                {probe.error && <div className={styles.probeError}>{probe.error}</div>}
+                {!!probe.available_models?.length && (
+                  <select className={styles.select} defaultValue={probe.available_models[0]}>
+                    {probe.available_models.map((m) => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                )}
+              </div>
+            )}
           </section>
 
           <section>

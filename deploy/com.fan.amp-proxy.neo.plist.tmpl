@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fan.amp-proxy.neo</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/AmpProxyNeo.app/Contents/MacOS/amp-proxy-neo</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ExitTimeOut</key>
+    <integer>20</integer>
+    <key>StandardOutPath</key>
+    <string>${HOME}/Library/Logs/amp-proxy-neo.log</string>
+    <key>StandardErrorPath</key>
+    <string>${HOME}/Library/Logs/amp-proxy-neo.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AMP_PROXY_NEO_ADMIN</key>
+        <string>:9320</string>
+        <key>AMP_PROXY_NEO_LISTEN</key>
+        <string>:9319</string>
+    </dict>
+</dict>
+</plist>

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,7 +48,31 @@ type Config struct {
 	Gemini         GeminiConfig      `yaml:"gemini"`
 	Custom         []CustomProvider  `yaml:"custom,omitempty"`
 	ModelRedirects map[string]string `yaml:"model-redirects,omitempty"` // e.g. "claude-opus-4-6" -> "claude-opus-4-7"
+	Neo            NeoConfig         `yaml:"neo"`
 	Retry          RetryConfig       `yaml:"retry"`
+}
+
+type ModeConfig struct {
+	Provider string `yaml:"provider" json:"provider"`
+	Model    string `yaml:"model" json:"model"`
+	Auth     string `yaml:"auth,omitempty" json:"auth,omitempty"`
+}
+
+type NeoConfig struct {
+	SelfServe bool                  `yaml:"self-serve" json:"self_serve"`
+	JWTSecret string                `yaml:"jwt-secret,omitempty" json:"jwt_secret,omitempty"`
+	UserID    string                `yaml:"user-id,omitempty" json:"user_id,omitempty"`
+	Modes     map[string]ModeConfig `yaml:"modes,omitempty" json:"modes,omitempty"`
+	Storage   NeoStorageConfig      `yaml:"storage,omitempty" json:"storage,omitempty"`
+	Update    NeoUpdateConfig       `yaml:"update" json:"update"`
+}
+
+type NeoStorageConfig struct {
+	ICloudSync bool `yaml:"icloud-sync,omitempty" json:"icloud_sync,omitempty"`
+}
+
+type NeoUpdateConfig struct {
+	Channel string `yaml:"channel" json:"channel"`
 }
 
 type AmpConfig struct {
@@ -239,6 +264,45 @@ func (c *Config) Save() error {
 	}
 
 	return os.WriteFile(c.path, data, 0o644)
+}
+
+func (c *Config) Dir() string {
+	c.Mu.RLock()
+	defer c.Mu.RUnlock()
+	if c.path == "" {
+		return ""
+	}
+	return filepath.Dir(c.path)
+}
+
+func (c *Config) SelfServe() bool {
+	c.Mu.RLock()
+	defer c.Mu.RUnlock()
+	return c.Neo.SelfServe
+}
+
+func (c *Config) ModeConfig(mode string) (ModeConfig, bool) {
+	c.Mu.RLock()
+	defer c.Mu.RUnlock()
+	if c.Neo.Modes == nil {
+		return ModeConfig{}, false
+	}
+	mc, ok := c.Neo.Modes[strings.ToLower(strings.TrimSpace(mode))]
+	return mc, ok && mc.Provider != "" && mc.Model != ""
+}
+
+func (c *Config) SetModeConfig(mode string, mc ModeConfig) {
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if c.Neo.Modes == nil {
+		c.Neo.Modes = make(map[string]ModeConfig)
+	}
+	if mc.Provider == "" && mc.Model == "" {
+		delete(c.Neo.Modes, mode)
+		return
+	}
+	c.Neo.Modes[mode] = mc
 }
 
 func (c *Config) ClaudeLocalAuthConfig() (source, authToken string) {

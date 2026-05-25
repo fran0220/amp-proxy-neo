@@ -14,9 +14,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fran0220/amp-proxy-neo/internal/neo/threadstore"
 	. "github.com/fran0220/amp-proxy-neo/pkg/auth"
 	. "github.com/fran0220/amp-proxy-neo/pkg/config"
 	. "github.com/fran0220/amp-proxy-neo/pkg/logger"
+	providerpkg "github.com/fran0220/amp-proxy-neo/pkg/provider"
 	"github.com/gorilla/websocket"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -197,6 +199,15 @@ func modelForAgentMode(mode string) (provider, model string) {
 	}
 }
 
+func modelForAgentModeWithConfig(mode string, cfg *Config) (provider, model string) {
+	if cfg != nil {
+		if mc, ok := cfg.ModeConfig(mode); ok {
+			return mc.Provider, mc.Model
+		}
+	}
+	return modelForAgentMode(mode)
+}
+
 // threadStore is process-global per-thread state so that multi-turn
 // conversations across separate amp invocations (each opens its own WS)
 // can share message history. Keyed by threadID.
@@ -235,6 +246,7 @@ type RivetSession struct {
 	logger *RequestLogger // logs each upstream LLM call (Anthropic/OpenAI/Gemini) for stats
 	cfg    *Config
 	auth   *AuthResolver
+	store  threadstore.Store
 
 	// currentRoute is set at the start of runLocalInference to the resolved
 	// auth route (RouteLocal / RouteAPIKey). Used by round handlers for
@@ -390,10 +402,11 @@ func (c anthropicContent) MarshalJSON() ([]byte, error) {
 	}
 }
 
-func newRivetSession(connID uint64, logger *RequestLogger) *RivetSession {
+func newRivetSession(connID uint64, logger *RequestLogger, store threadstore.Store) *RivetSession {
 	return &RivetSession{
 		connID:             connID,
 		logger:             logger,
+		store:              store,
 		pluginHooks:        make(map[string]chan []byte),
 		pendingToolResults: make(map[string]chan []byte),
 		// Server's first message_added (user) has seq=2 in observed traces;
@@ -418,9 +431,9 @@ func (s *RivetSession) bindThread() {
 	}
 }
 
-// persistThread writes the in-memory session history back to threadStore so
+// persistInMemoryThread writes the in-memory session history back to threadStore so
 // the next connection for this threadID can resume.
-func (s *RivetSession) persistThread() {
+func (s *RivetSession) persistInMemoryThread() {
 	if s.threadID == "" {
 		return
 	}
@@ -1328,10 +1341,13 @@ func (s *RivetSession) runLocalInference(
 	// before processing any tool calls in this turn.
 	<-hooksDone
 
-	provider, model := modelForAgentMode(s.agentMode)
+	provider, model := modelForAgentModeWithConfig(s.agentMode, s.cfg)
 	log.Infof("[RIVET %d] dispatch agentMode=%s → %s/%s", s.connID, s.agentMode, provider, model)
 
 	authInfo, route := auth.Resolve(ctx, provider, model)
+	if mc, ok := cfg.ModeConfig(s.agentMode); ok && mc.Auth != "" {
+		authInfo, route = auth.ResolveByRef(ctx, mc.Auth)
+	}
 	// Accept both RouteLocal (OAuth) and RouteAPIKey (user's own key with
 	// optional BaseURL override) — both keep inference off the Amp servers.
 	if authInfo == nil || !authInfo.Valid() || (route != RouteLocal && route != RouteAPIKey) {
@@ -1487,14 +1503,14 @@ func (s *RivetSession) runLocalInference(
 			})
 		}(titleFirstMsg)
 	}
-	// Persist the assembled thread (user + assistant + any tool rounds) to
-	// the Amp server via /api/internal?uploadThread. amp client's own
-	// throttled uploader can't be relied on in execute-mode because it
-	// exits before the 1s throttle fires.
+	// Persist the assembled thread (user + assistant + any tool rounds) locally
+	// first, then best-effort upload upstream. amp client's own throttled
+	// uploader can't be relied on in execute-mode because it exits before the
+	// 1s throttle fires.
 	go func() {
 		bgCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
-		s.persistThreadToAmp(bgCtx, cfg)
+		s.persistThread(bgCtx, cfg)
 	}()
 	return nil
 }
@@ -1521,6 +1537,9 @@ func (s *RivetSession) runOneInferenceRound(
 		return s.runOpenAIRound(ctx, client, clientMu, authInfo, model, writeFrameRaw)
 	case "google":
 		return s.runGeminiRound(ctx, client, clientMu, authInfo, model, writeFrameRaw)
+	}
+	if strings.HasPrefix(provider, "custom:") {
+		return s.runCustomOpenAIRound(ctx, client, clientMu, authInfo, provider, model, writeFrameRaw)
 	}
 	// fall through to anthropic-inline path below
 	system := s.buildSystemPrompt()
@@ -2023,7 +2042,7 @@ func (s *RivetSession) runOneInferenceRound(
 		Content: historyContent,
 	})
 	s.mu.Unlock()
-	s.persistThread()
+	s.persistInMemoryThread()
 
 	if len(toolCalls) == 0 || stopReason == "end_turn" {
 		// Signal idle so amp's UI exits its "streaming" state. Persistence
@@ -2134,7 +2153,7 @@ func (s *RivetSession) runOneInferenceRound(
 		Content: toolResults,
 	})
 	s.mu.Unlock()
-	s.persistThread()
+	s.persistInMemoryThread()
 
 	return false, finalText, messageID, nil
 }
@@ -2584,7 +2603,7 @@ func (s *RivetSession) runOpenAIRound(
 		Content: historyContent,
 	})
 	s.mu.Unlock()
-	s.persistThread()
+	s.persistInMemoryThread()
 
 	if len(toolCalls) == 0 {
 		clientMu.Lock()
@@ -2665,7 +2684,192 @@ func (s *RivetSession) runOpenAIRound(
 		Content: toolResults,
 	})
 	s.mu.Unlock()
-	s.persistThread()
+	s.persistInMemoryThread()
 
 	return false, finalText, messageID, nil
+}
+
+func (s *RivetSession) runCustomOpenAIRound(
+	ctx context.Context,
+	client *websocket.Conn,
+	clientMu *sync.Mutex,
+	authInfo *ProviderAuth,
+	providerRef string,
+	model string,
+	writeFrameRaw func(map[string]any) error,
+) (stop bool, finalText, msgID string, err error) {
+	s.mu.Lock()
+	historyCopy := make([]anthropicMessage, len(s.history))
+	copy(historyCopy, s.history)
+	rawTools := append([]map[string]any(nil), s.anthroTools...)
+	s.mu.Unlock()
+
+	baseURL := strings.TrimSpace(authInfo.BaseURL)
+	if baseURL == "" {
+		return false, "", "", fmt.Errorf("custom provider %s has empty base-url", providerRef)
+	}
+	h := providerpkg.NewCustomOpenAIHandler(baseURL, authInfo.Token)
+	probe := h.Probe(ctx)
+	if probe.Error != "" && len(probe.AvailableModels) == 0 {
+		return false, "", "", fmt.Errorf("custom provider %s probe failed: %s", providerRef, probe.Error)
+	}
+
+	messages := make([]map[string]any, 0, len(historyCopy)+1)
+	system := s.buildSystemPrompt()
+	toolDefs := make([]providerpkg.ToolDef, 0, len(rawTools))
+	for _, t := range rawTools {
+		toolDefs = append(toolDefs, providerpkg.ToolDef(t))
+	}
+	toolsField, systemAppend := providerpkg.PrepareToolsRequest(toolDefs, !probe.SupportsTools)
+	messages = append(messages, map[string]any{"role": "system", "content": system + systemAppend})
+	for _, msg := range historyCopy {
+		switch msg.Role {
+		case "user":
+			var text strings.Builder
+			for _, c := range msg.Content {
+				if c.Type == "text" {
+					text.WriteString(c.Text)
+				} else if c.Type == "tool_result" {
+					messages = append(messages, map[string]any{"role": "tool", "tool_call_id": c.ToolUseID, "content": c.ToolContent})
+				}
+			}
+			if text.Len() > 0 {
+				messages = append(messages, map[string]any{"role": "user", "content": text.String()})
+			}
+		case "assistant":
+			var text strings.Builder
+			var calls []map[string]any
+			for _, c := range msg.Content {
+				if c.Type == "text" {
+					text.WriteString(c.Text)
+				} else if c.Type == "tool_use" {
+					args, _ := json.Marshal(c.ToolInput)
+					calls = append(calls, map[string]any{"id": c.ToolUseID, "type": "function", "function": map[string]any{"name": c.ToolName, "arguments": string(args)}})
+				}
+			}
+			m := map[string]any{"role": "assistant", "content": text.String()}
+			if len(calls) > 0 {
+				m["tool_calls"] = calls
+			}
+			messages = append(messages, m)
+		}
+	}
+	reqBody := map[string]any{"model": model, "messages": messages, "stream": true}
+	if toolsField != nil {
+		reqBody["tools"] = toolsField
+		reqBody["tool_choice"] = "auto"
+	}
+	if systemAppend != "" {
+		reqBody["response_format"] = map[string]any{"type": "json_object"}
+	}
+	bodyBytes, _ := json.Marshal(reqBody)
+
+	messageID := newAmpMessageID()
+	toolNames := make([]string, 0, len(rawTools))
+	for _, t := range rawTools {
+		if n, _ := t["name"].(string); n != "" {
+			toolNames = append(toolNames, n)
+		}
+	}
+	_ = writeFrameRaw(map[string]any{"type": "inference_tools", "messageId": messageID, "agentMode": s.agentMode, "tools": toolNames})
+	_ = writeFrameRaw(map[string]any{"type": "agent_state", "state": "streaming", "messageId": messageID, "agentMode": s.agentMode, "reasoningEffort": "medium"})
+	_ = writeFrameRaw(map[string]any{"type": "delta", "messageId": messageID, "role": "assistant", "state": "start"})
+	_ = writeFrameRaw(map[string]any{"type": "delta", "messageId": messageID, "role": "assistant", "blocks": []map[string]any{{"type": "text", "text": "", "blockState": "start"}}, "blockIndex": 0, "state": "generating"})
+
+	if s.logger != nil {
+		s.logger.LogRequest(model, providerRef, routeLabelFor(s.currentRoute), "/v1/chat/completions", time.Now())
+	}
+	streamText := systemAppend == ""
+	res, err := h.StreamChatCompletion(ctx, bodyBytes, func(delta string) {
+		if streamText {
+			_ = writeFrameRaw(map[string]any{"type": "delta", "messageId": messageID, "role": "assistant", "blocks": []map[string]any{{"type": "text", "text": delta, "blockState": "streaming"}}, "blockIndex": 0, "state": "generating"})
+		}
+	})
+	if s.logger != nil {
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		s.logger.RecordResult(model, 200, TokenUsage{}, 0, errMsg, "", "")
+	}
+	if err != nil {
+		return false, "", "", err
+	}
+	text := res.Text
+	toolUses := res.ToolUses
+	if systemAppend != "" {
+		text, toolUses = providerpkg.ParseToolsResponse(res.Text)
+		if text != "" {
+			_ = writeFrameRaw(map[string]any{"type": "delta", "messageId": messageID, "role": "assistant", "blocks": []map[string]any{{"type": "text", "text": text, "blockState": "streaming"}}, "blockIndex": 0, "state": "generating"})
+		}
+	}
+	_ = writeFrameRaw(map[string]any{"type": "delta", "messageId": messageID, "role": "assistant", "blocks": []map[string]any{{"type": "text", "text": "", "blockState": "complete"}}, "blockIndex": 0, "state": "generating"})
+
+	assistantContent := []map[string]any{{"type": "text", "text": text, "blockState": "complete"}}
+	historyContent := []anthropicContent{{Type: "text", Text: text}}
+	type pendingCall struct {
+		callID, ampID, name string
+		input               map[string]any
+	}
+	var calls []pendingCall
+	for i, tu := range toolUses {
+		callID := tu.ID
+		if callID == "" {
+			callID = fmt.Sprintf("call_%s_%d", newAmpMessageIDRaw(), i)
+		}
+		ampID := "TU-" + newAmpMessageIDRaw()
+		input := tu.Input
+		if input == nil {
+			input = map[string]any{}
+		}
+		calls = append(calls, pendingCall{callID: callID, ampID: ampID, name: tu.Name, input: input})
+		assistantContent = append(assistantContent, map[string]any{"type": "tool_use", "id": ampID, "name": tu.Name, "blockState": "complete", "complete": true, "input": input})
+		historyContent = append(historyContent, anthropicContent{Type: "tool_use", ToolUseID: callID, ToolName: tu.Name, ToolInput: input})
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_ = writeFrameRaw(map[string]any{"type": "message_added", "message": map[string]any{"threadId": s.threadID, "role": "assistant", "content": assistantContent, "state": map[string]any{"type": "complete"}, "messageId": messageID, "createdAt": now}, "seq": s.takeSeq()})
+	s.mu.Lock()
+	s.history = append(s.history, anthropicMessage{Role: "assistant", Content: historyContent})
+	s.mu.Unlock()
+	s.persistInMemoryThread()
+	if len(calls) == 0 {
+		clientMu.Lock()
+		_ = client.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "turn complete"), time.Now().Add(2*time.Second))
+		clientMu.Unlock()
+		return true, text, messageID, nil
+	}
+
+	_ = writeFrameRaw(map[string]any{"type": "agent_state", "state": "running_tools", "messageId": messageID, "agentMode": s.agentMode, "reasoningEffort": "medium"})
+	toolResults := make([]anthropicContent, 0, len(calls))
+	for _, call := range calls {
+		ch := s.registerPendingTool(call.ampID)
+		_ = writeFrameRaw(map[string]any{"type": "tool_lease", "toolCallId": call.ampID, "toolName": call.name, "args": call.input, "messageId": messageID})
+		var resultData []byte
+		select {
+		case resultData = <-ch:
+		case <-time.After(5 * time.Minute):
+			s.unregisterPendingTool(call.ampID)
+			return true, "", "", fmt.Errorf("tool %s (%s) timed out", call.name, call.ampID)
+		case <-ctx.Done():
+			s.unregisterPendingTool(call.ampID)
+			return true, "", "", ctx.Err()
+		}
+		s.unregisterPendingTool(call.ampID)
+		runPayload := gjson.GetBytes(resultData, "run")
+		var runObj any
+		_ = json.Unmarshal([]byte(runPayload.Raw), &runObj)
+		_ = writeFrameRaw(map[string]any{"type": "tool_progress", "toolCallId": call.ampID, "progress": map[string]any{"type": "snapshot", "value": runObj}})
+		_ = writeFrameRaw(map[string]any{"type": "executor_tool_result_ack", "toolCallId": call.ampID})
+		_ = writeFrameRaw(map[string]any{"type": "message_added", "message": map[string]any{"threadId": s.threadID, "role": "user", "content": []map[string]any{{"type": "tool_result", "toolUseID": call.ampID, "run": runObj}}, "messageId": newAmpMessageID(), "createdAt": time.Now().UTC().Format(time.RFC3339Nano)}, "seq": s.takeSeq()})
+		serialized := ""
+		if r := runPayload.Get("result"); r.Exists() {
+			serialized = r.Raw
+		}
+		toolResults = append(toolResults, anthropicContent{Type: "tool_result", ToolUseID: call.callID, ToolContent: serialized})
+	}
+	s.mu.Lock()
+	s.history = append(s.history, anthropicMessage{Role: "user", Content: toolResults})
+	s.mu.Unlock()
+	s.persistInMemoryThread()
+	return false, text, messageID, nil
 }

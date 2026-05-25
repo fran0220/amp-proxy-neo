@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fran0220/amp-proxy-neo/internal/neo/selfserve"
+	"github.com/fran0220/amp-proxy-neo/internal/neo/threadstore"
 	. "github.com/fran0220/amp-proxy-neo/pkg/auth"
 	. "github.com/fran0220/amp-proxy-neo/pkg/config"
 	. "github.com/fran0220/amp-proxy-neo/pkg/logger"
@@ -52,12 +54,14 @@ type RivetGateway struct {
 	authResolver   *AuthResolver
 	cfg            *Config
 	logger         *RequestLogger
+	threadStore    threadstore.Store
 	// injectLocal toggles local inference injection. When false the forwarder
 	// is a pure transparent WS proxy (server-side LLM inference). Defaults to
 	// true; set AMP_PROXY_RIVET_PASSTHROUGH=1 to disable.
-	injectLocal bool
-	frameSeq    uint64
-	mu          sync.Mutex
+	injectLocal   bool
+	selfServeMode bool
+	frameSeq      uint64
+	mu            sync.Mutex
 }
 
 // rivetPathPrefixes are HTTP paths that the Amp Neo CLI's Rivet client hits
@@ -74,7 +78,8 @@ var rivetPathPrefixes = []string{
 // New creates a Rivet gateway using the configured upstream host/credentials.
 // cfg+authResolver are used by the local inference orchestrator to call the
 // user's configured model providers.
-func New(cfg *Config, authResolver *AuthResolver, logger *RequestLogger) *RivetGateway {
+func New(cfg *Config, authResolver *AuthResolver, logger *RequestLogger, store threadstore.Store, selfServe ...bool) *RivetGateway {
+	selfServeMode := len(selfServe) > 0 && selfServe[0]
 	upstreamHost, upstreamUser, upstreamPass := resolveUpstream(cfg)
 	dialer := *websocket.DefaultDialer
 	dialer.TLSClientConfig = &tls.Config{}
@@ -131,7 +136,9 @@ func New(cfg *Config, authResolver *AuthResolver, logger *RequestLogger) *RivetG
 		authResolver:   authResolver,
 		cfg:            cfg,
 		logger:         logger,
+		threadStore:    store,
 		injectLocal:    inject,
+		selfServeMode:  selfServeMode,
 	}
 }
 
@@ -208,6 +215,9 @@ func (f *RivetGateway) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	f.httpProxy.ServeHTTP(w, r)
 }
 
+// HandleWS is the public WebSocket entry point used by the Neo binary.
+func (f *RivetGateway) HandleWS(w http.ResponseWriter, r *http.Request) { f.Handle(w, r) }
+
 // CanHandle returns true if this WS upgrade looks like an Amp Neo Rivet
 // gateway connection (carries the "rivet" subprotocol).
 func (f *RivetGateway) CanHandle(r *http.Request) bool {
@@ -231,6 +241,14 @@ func (f *RivetGateway) nextSeq() uint64 {
 
 // Handle accepts the client WS, opens upstream, pipes frames both ways.
 func (f *RivetGateway) Handle(w http.ResponseWriter, r *http.Request) {
+	if f.selfServeMode {
+		f.handleSelfServeMode(w, r)
+		return
+	}
+	f.handleProxyMode(w, r)
+}
+
+func (f *RivetGateway) handleProxyMode(w http.ResponseWriter, r *http.Request) {
 	subprotocols := websocket.Subprotocols(r)
 	connID := f.nextSeq()
 	log.Infof("[RIVET %d] incoming WS path=%s host=%s subprotocols=%v", connID, r.URL.Path, r.Host, subprotocols)
@@ -298,7 +316,7 @@ func (f *RivetGateway) Handle(w http.ResponseWriter, r *http.Request) {
 	// Per-connection session state + serialization for client writes (since
 	// both the inference orchestrator and the upstream pipe may write
 	// concurrently).
-	session := newRivetSession(connID, f.logger)
+	session := newRivetSession(connID, f.logger, f.threadStore)
 	threadID, agentMode := extractRivetSessionInfo(subprotocols)
 	session.threadID = threadID
 	if agentMode == "" {
@@ -335,6 +353,73 @@ func (f *RivetGateway) Handle(w http.ResponseWriter, r *http.Request) {
 
 	wg.Wait()
 	log.Infof("[RIVET %d] closed", connID)
+}
+
+func (f *RivetGateway) handleSelfServeMode(w http.ResponseWriter, r *http.Request) {
+	subprotocols := websocket.Subprotocols(r)
+	connID := f.nextSeq()
+	log.Infof("[RIVET %d] incoming self-serve WS path=%s host=%s subprotocols=%v", connID, r.URL.Path, r.Host, subprotocols)
+
+	clientUpgrader := websocket.Upgrader{
+		ReadBufferSize:    8192,
+		WriteBufferSize:   8192,
+		CheckOrigin:       func(*http.Request) bool { return true },
+		Subprotocols:      subprotocols,
+		EnableCompression: false,
+	}
+	client, err := clientUpgrader.Upgrade(w, r, http.Header{})
+	if err != nil {
+		log.Errorf("[RIVET %d] self-serve client upgrade failed: %v", connID, err)
+		return
+	}
+	defer client.Close()
+
+	session := newRivetSession(connID, f.logger, f.threadStore)
+	threadID, agentMode := extractRivetSessionInfo(subprotocols)
+	session.threadID = threadID
+	if agentMode == "" {
+		agentMode = "smart"
+	}
+	session.agentMode = agentMode
+	log.Infof("[RIVET %d] self-serve session bound: thread=%s agentMode=%s", connID, threadID, agentMode)
+	session.bindThread()
+	notifyPendingNewThread(threadID)
+
+	userID := ""
+	if f.cfg != nil {
+		userID = f.cfg.Neo.UserID
+	}
+	if userID == "" {
+		if dir, err := selfserve.DefaultDir(); err == nil {
+			if id, err := selfserve.LoadOrCreateUserID(dir); err == nil {
+				userID = id
+			}
+		}
+	}
+
+	var clientWriteMu sync.Mutex
+	for _, frame := range selfserve.SynthesizeStartupFrames(threadID, agentMode, userID) {
+		data, err := json.Marshal(frame)
+		if err != nil {
+			log.Warnf("[RIVET %d] marshal startup frame failed: %v", connID, err)
+			continue
+		}
+		f.logFrame(connID, "<", websocket.TextMessage, data)
+		clientWriteMu.Lock()
+		err = client.WriteMessage(websocket.TextMessage, data)
+		clientWriteMu.Unlock()
+		if err != nil {
+			log.Errorf("[RIVET %d] write startup frame failed: %v", connID, err)
+			return
+		}
+	}
+
+	closeClient := func(reason string) {
+		_ = client.Close()
+		log.Infof("[RIVET %d] self-serve closing: %s", connID, reason)
+	}
+	f.pipeClient(connID, client, nil, session, &clientWriteMu, closeClient)
+	log.Infof("[RIVET %d] self-serve closed", connID)
 }
 
 // pipeClient forwards client->upstream frames, but inspects each one. If the
@@ -435,6 +520,11 @@ func (f *RivetGateway) pipeClient(
 			}
 		} else {
 			f.logFrame(connID, ">", msgType, data)
+		}
+
+		if upstream == nil {
+			log.Debugf("[RIVET %d] self-serve dropped client frame without upstream", connID)
+			continue
 		}
 
 		if err := upstream.WriteMessage(msgType, data); err != nil {

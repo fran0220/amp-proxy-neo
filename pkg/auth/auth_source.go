@@ -34,7 +34,7 @@ type ProviderAuth struct {
 }
 
 func (a *ProviderAuth) Valid() bool {
-	return a != nil && a.Token != "" && a.Error == nil
+	return a != nil && (a.Token != "" || a.Source == "custom") && a.Error == nil
 }
 
 // AuthResolver resolves credentials for a given provider and route.
@@ -53,6 +53,9 @@ func NewAuthResolver(cfg *Config, claudeProfiles *ClaudeProfileManager, codexMgr
 // If the requested route's source is unavailable, falls back: local → apikey → amp.
 // Also checks tier compatibility (e.g., image models not available via Gemini CLI).
 func (ar *AuthResolver) Resolve(ctx context.Context, provider, model string) (*ProviderAuth, string) {
+	if strings.HasPrefix(provider, "custom:") {
+		return ar.ResolveByRef(ctx, provider)
+	}
 	route := ar.cfg.ModelRoute(provider, model)
 	if route == RouteAmp {
 		return nil, RouteAmp
@@ -82,6 +85,43 @@ func (ar *AuthResolver) Resolve(ctx context.Context, provider, model string) (*P
 
 	log.Warnf("[AUTH] %s/%s no credentials available, falling back to amp", provider, model)
 	return nil, RouteAmp
+}
+
+func (ar *AuthResolver) ResolveByRef(ctx context.Context, ref string) (*ProviderAuth, string) {
+	_ = ctx
+	ref = strings.TrimSpace(ref)
+	switch {
+	case ref == "local-oauth":
+		return &ProviderAuth{Error: fmt.Errorf("local-oauth auth ref requires a concrete provider")}, RouteLocal
+	case strings.HasPrefix(ref, "api-key:"):
+		id := strings.TrimPrefix(ref, "api-key:")
+		for _, provider := range []string{"claude", "openai", "gemini"} {
+			if entry, ok := ar.cfg.APIKey(provider, id); ok {
+				authType := AuthBearer
+				if provider == "claude" {
+					authType = AuthXAPIKey
+				}
+				if provider == "gemini" {
+					authType = AuthGoogAPIKey
+				}
+				return &ProviderAuth{Token: entry.APIKey, AuthType: authType, Source: "api-key", BaseURL: entry.BaseURL}, RouteAPIKey
+			}
+		}
+		return &ProviderAuth{Error: fmt.Errorf("api key %q not found", id), Source: "api-key"}, RouteAPIKey
+	case strings.HasPrefix(ref, "custom:"):
+		id := strings.TrimPrefix(ref, "custom:")
+		cp, ok := ar.cfg.CustomProvider(id)
+		if !ok {
+			return &ProviderAuth{Error: fmt.Errorf("custom provider %q not found", id), Source: "custom"}, RouteAPIKey
+		}
+		key := ""
+		if len(cp.Entries) > 0 {
+			key = cp.Entries[0].APIKey
+		}
+		return &ProviderAuth{Token: key, AuthType: AuthBearer, Source: "custom", BaseURL: cp.BaseURL}, RouteAPIKey
+	default:
+		return &ProviderAuth{Error: fmt.Errorf("unknown auth ref: %s", ref)}, RouteAmp
+	}
 }
 
 func (ar *AuthResolver) resolveRoute(ctx context.Context, provider, route string) *ProviderAuth {

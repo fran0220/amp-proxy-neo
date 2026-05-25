@@ -43,6 +43,9 @@ func (s *AdminServer) handleThreadsList(w http.ResponseWriter, r *http.Request) 
 		} `json:"result"`
 	}
 	_ = json.Unmarshal(resp, &envelope)
+	if envelope.Result.Threads == nil {
+		envelope.Result.Threads = []any{}
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"threads": envelope.Result.Threads})
 }
 

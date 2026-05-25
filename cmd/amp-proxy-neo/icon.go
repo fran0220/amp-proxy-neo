@@ -2,6 +2,8 @@ package main
 
 // iconPurple is a generated 22x22 purple circle PNG for the macOS menu bar.
 var iconPurple = generateCirclePNG(0xA7, 0x55, 0xF7) // #A755F7
+var iconRed = generateCirclePNG(0xFF, 0x5A, 0x5F)    // #FF5A5F
+var iconYellow = generateCirclePNG(0xFF, 0xC8, 0x47) // degraded / updating
 
 func generateCirclePNG(r, g, b byte) []byte {
 	const size = 22

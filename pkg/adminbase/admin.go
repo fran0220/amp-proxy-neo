@@ -78,12 +78,15 @@ func (s *AdminServer) RegisterAPIWithoutStatus(mux *http.ServeMux) {
 	mux.HandleFunc("/api/keys/test", s.handleTestAPIKey)
 	mux.HandleFunc("/api/keys/discover", s.handleDiscoverModels)
 	mux.HandleFunc("/api/custom-provider", s.handleCustomProvider)
+	mux.HandleFunc("/api/llm-probe", s.handleLLMProbe)
+	mux.HandleFunc("/api/modes", s.handleModes)
 	mux.HandleFunc("/api/version", s.handleVersion)
 	mux.HandleFunc("/api/update/check", s.handleCheckUpdate)
 	mux.HandleFunc("/api/redirects", s.handleRedirects)
 	mux.HandleFunc("/api/redirects/set", s.handleSetRedirect)
 	mux.HandleFunc("/api/claude/profiles", s.handleClaudeProfiles)
 	mux.HandleFunc("/api/claude/profiles/active", s.handleClaudeProfileSwitch)
+	mux.HandleFunc("/api/sync/conflicts", s.handleSyncConflicts)
 }
 
 func (s *AdminServer) RegisterThreadAPI(mux *http.ServeMux) {

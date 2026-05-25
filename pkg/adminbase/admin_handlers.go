@@ -1,8 +1,12 @@
 package adminbase
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +39,23 @@ func (s *AdminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *AdminServer) handleVersion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"version": util.Version})
+}
+
+func (s *AdminServer) handleSyncConflicts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 50
+	}
+	lines, err := readLastLines(filepath.Join(s.cfg.Dir(), "sync-conflicts.log"), limit)
+	if err != nil {
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"conflicts": lines})
 }
 
 func (s *AdminServer) handleCheckUpdate(w http.ResponseWriter, r *http.Request) {
@@ -192,6 +213,35 @@ func (s *AdminServer) handleTokenRefresh(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+func readLastLines(path string, limit int) ([]string, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if len(lines) > limit {
+		lines = lines[len(lines)-limit:]
+	}
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+	return lines, nil
 }
 
 // handleClaudeProfiles lists all configured Claude profiles plus their
@@ -905,4 +955,36 @@ func (s *AdminServer) handleSetRedirect(w http.ResponseWriter, r *http.Request) 
 	}
 	log.Infof("[ADMIN] model redirect %s: %s -> %s", action, req.From, req.To)
 	writeJSON(w, map[string]string{"ok": "true"})
+}
+
+func (s *AdminServer) handleModes(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.cfg.Mu.RLock()
+		modes := s.cfg.Neo.Modes
+		if modes == nil {
+			modes = map[string]ModeConfig{}
+		}
+		s.cfg.Mu.RUnlock()
+		writeJSON(w, map[string]any{"modes": modes})
+	case http.MethodPost:
+		var req struct {
+			Mode     string `json:"mode"`
+			Provider string `json:"provider"`
+			Model    string `json:"model"`
+			Auth     string `json:"auth"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.cfg.SetModeConfig(req.Mode, ModeConfig{Provider: req.Provider, Model: req.Model, Auth: req.Auth})
+		if err := s.cfg.Save(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]string{"status": "ok"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }

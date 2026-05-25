@@ -1,0 +1,15 @@
+# vLLM OpenAI-compatible server.
+# Recommended for native tools: python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-Coder-7B-Instruct --enable-auto-tool-choice --tool-call-parser hermes
+custom:
+  - id: vllm
+    name: vLLM
+    base-url: http://localhost:8000/v1
+    models:
+      - name: Qwen/Qwen2.5-Coder-7B-Instruct
+        route: apikey
+neo:
+  modes:
+    rush:
+      provider: custom:vllm
+      model: Qwen/Qwen2.5-Coder-7B-Instruct
+      auth: custom:vllm

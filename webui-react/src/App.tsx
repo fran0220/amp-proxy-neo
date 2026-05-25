@@ -2,12 +2,12 @@ import { useCallback, useEffect, useState } from "react";
 import { Sidebar } from "./components/Sidebar/Sidebar";
 import { ChatPanel } from "./components/Chat/ChatPanel";
 import { SettingsDrawer } from "./components/Settings/SettingsDrawer";
-import { useCoordinator } from "./hooks/useCoordinator";
+import { useChat } from "./hooks/useChat";
 import { apiFetch } from "./lib/api";
 import type { Message, ThreadData, ThreadSummary } from "./lib/types";
 
 export function App() {
-  const { online, send, subscribe } = useCoordinator();
+  const { online, error, send, cancel, subscribe } = useChat();
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [activeThread, setActiveThread] = useState<ThreadData | null>(null);
@@ -116,11 +116,14 @@ export function App() {
         onClose={() => setSidebarOpen(false)}
       />
       <ChatPanel
+        connectionMode="direct"
         activeThread={activeThread}
         activeThreadId={activeThreadId}
         messages={messages}
         online={online}
+        connectionError={error}
         send={send}
+        cancel={cancel}
         subscribe={subscribe}
         onMessageCommitted={onMessageCommitted}
         onThreadCreated={onThreadCreated}
