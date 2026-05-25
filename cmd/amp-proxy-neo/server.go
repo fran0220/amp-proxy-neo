@@ -32,6 +32,7 @@ func (s *appState) proxyMux() http.Handler {
 	mux.HandleFunc("/api/internal", s.internal)
 	mux.HandleFunc("/api/telemetry", s.telemetry)
 	mux.HandleFunc("/api/v2/spans", s.telemetry)
+	mux.Handle("/api/provider/", newProviderRouter(s))
 	if s.cfg.SelfServe() {
 		actors := selfserve.ActorsHandler()
 		mux.Handle("/metadata", selfserve.MetadataHandler())

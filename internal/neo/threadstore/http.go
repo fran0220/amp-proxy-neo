@@ -85,7 +85,12 @@ func (h *Handler) handleGetThread(w http.ResponseWriter, r *http.Request, params
 	}
 	thread, err := h.store.GetThread(r.Context(), id)
 	if errors.Is(err, ErrNotFound) {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		// amp CLI shape: `if (!r.ok && r.error.code === "thread-not-found") return null`.
+		// Return 200 with the error envelope so callers can branch on it.
+		writeJSON(w, map[string]any{
+			"ok":    false,
+			"error": map[string]any{"code": "thread-not-found", "message": err.Error()},
+		})
 		return
 	}
 	if err != nil {

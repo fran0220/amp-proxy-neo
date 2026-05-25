@@ -73,13 +73,15 @@ func (h *internalRouter) getUserInfo(w http.ResponseWriter) {
 	// the user, not { user: {...} }. See amp-darwin-arm64 binary for the
 	// `T?{user:T,features:T.features,workspace:T?.team,...}` mapping.
 	writeJSON(w, http.StatusOK, ok(map[string]any{
-		"id":               h.cfg.UserID,
-		"username":         "local",
-		"displayName":      "Local",
-		"email":            h.cfg.UserID + "@amp-proxy-neo.local",
-		"avatarURL":        "",
-		"features":         map[string]any{},
-		"team":             nil,
+		"id":          h.cfg.UserID,
+		"username":    "local",
+		"displayName": "Local",
+		"email":       h.cfg.UserID + "@amp-proxy-neo.local",
+		"avatarURL":   "",
+		// features is iterated as `features.some(f => f.name === X && f.enabled)`
+		// so it MUST be an array of {name, enabled} objects, never a map.
+		"features":          []any{},
+		"team":              nil,
 		"mysteriousMessage": "",
 	}))
 }
